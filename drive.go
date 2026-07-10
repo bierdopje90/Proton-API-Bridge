@@ -2,6 +2,7 @@ package proton_api_bridge
 
 import (
 	"context"
+	"sync"
 
 	"github.com/rclone/Proton-API-Bridge/common"
 	"golang.org/x/sync/semaphore"
@@ -29,6 +30,12 @@ type ProtonDrive struct {
 	cache                *cache
 	blockUploadSemaphore *semaphore.Weighted
 	blockCryptoSemaphore *semaphore.Weighted
+
+	// Public keyrings of external signers (e.g. the owner of a shared-with-me
+	// share), fetched lazily from the keys API and cached by email address.
+	// A nil entry records a failed lookup so it is not retried on every link.
+	pubKeyCache   map[string]*crypto.KeyRing
+	pubKeyCacheMu sync.Mutex
 }
 
 func NewDefaultConfig() *common.Config {
@@ -59,48 +66,57 @@ func NewProtonDrive(ctx context.Context, config *common.Config, authHandler prot
 
 		MIMETYPE holds type, e.g. folder, image/png, etc.
 	*/
-	volumes, err := listAllVolumes(ctx, c)
-	if err != nil {
-		return nil, nil, err
-	}
-	// log.Printf("all volumes %#v", volumes)
-
-	mainShareID := ""
-	for i := range volumes {
-		// iOS drive: first active volume
-		if volumes[i].State == proton.VolumeStateActive {
-			mainShareID = volumes[i].Share.ShareID
-		}
-	}
-	// log.Println("total volumes", len(volumes), "mainShareID", mainShareID)
-
-	/* Get root folder from the main share of the volume */
-	mainShare, err := getShareByID(ctx, c, mainShareID)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// check for main share integrity
-	{
-		mainShareCheck := false
-		shares, err := getAllShares(ctx, c)
+	var mainShare *proton.Share
+	if config.SharedShareID != "" {
+		/* Operate on a specific share (e.g. a shared-with-me folder) instead of the volume main share */
+		mainShare, err = getSharedShare(ctx, config, c)
 		if err != nil {
 			return nil, nil, err
 		}
-		for i := range shares {
-			if shares[i].ShareID == mainShare.ShareID &&
-				shares[i].LinkID == mainShare.LinkID &&
-				shares[i].Flags == proton.PrimaryShare &&
-				shares[i].Type == proton.ShareTypeMain {
-				mainShareCheck = true
+	} else {
+		volumes, err := listAllVolumes(ctx, c)
+		if err != nil {
+			return nil, nil, err
+		}
+		// log.Printf("all volumes %#v", volumes)
+
+		mainShareID := ""
+		for i := range volumes {
+			// iOS drive: first active volume
+			if volumes[i].State == proton.VolumeStateActive {
+				mainShareID = volumes[i].Share.ShareID
 			}
 		}
+		// log.Println("total volumes", len(volumes), "mainShareID", mainShareID)
 
-		if !mainShareCheck {
-			logger := config.GetLogger()
-			logger.Errorf("mainShare %#v", mainShare)
-			logger.Errorf("shares %#v", shares)
-			return nil, nil, ErrMainSharePreconditionsFailed
+		/* Get root folder from the main share of the volume */
+		mainShare, err = getShareByID(ctx, c, mainShareID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// check for main share integrity
+		{
+			mainShareCheck := false
+			shares, err := getAllShares(ctx, c)
+			if err != nil {
+				return nil, nil, err
+			}
+			for i := range shares {
+				if shares[i].ShareID == mainShare.ShareID &&
+					shares[i].LinkID == mainShare.LinkID &&
+					shares[i].Flags == proton.PrimaryShare &&
+					shares[i].Type == proton.ShareTypeMain {
+					mainShareCheck = true
+				}
+			}
+
+			if !mainShareCheck {
+				logger := config.GetLogger()
+				logger.Errorf("mainShare %#v", mainShare)
+				logger.Errorf("shares %#v", shares)
+				return nil, nil, ErrMainSharePreconditionsFailed
+			}
 		}
 	}
 
@@ -124,9 +140,26 @@ func NewProtonDrive(ctx context.Context, config *common.Config, authHandler prot
 	mainShareAddrKR := addrKRs[mainShare.AddressID]
 	// log.Println("addrKR CountDecryptionEntities", addrKR.CountDecryptionEntities())
 
-	mainShareKR, err := mainShare.GetKeyRing(mainShareAddrKR)
-	if err != nil {
-		return nil, nil, err
+	var mainShareKR *crypto.KeyRing
+	signatureAddress := mainShare.Creator
+	if config.SharedShareID != "" {
+		// A shared-with-me share is unlocked via the membership key packet,
+		// and everything we write into it is signed with our own member address.
+		mainShareKR, err = unlockShareKeyRing(config, mainShare, mainShareAddrKR)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		for email, addr := range addrData {
+			if addr.ID == mainShare.AddressID {
+				signatureAddress = email
+			}
+		}
+	} else {
+		mainShareKR, err = mainShare.GetKeyRing(mainShareAddrKR)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	// log.Println("mainShareKR CountDecryptionEntities", mainShareKR.CountDecryptionEntities())
 
@@ -144,11 +177,13 @@ func NewProtonDrive(ctx context.Context, config *common.Config, authHandler prot
 		userKR:           userKR,
 		addrKRs:          addrKRs,
 		addrData:         addrData,
-		signatureAddress: mainShare.Creator,
+		signatureAddress: signatureAddress,
 
 		cache:                newCache(config.EnableCaching, config.GetLogger()),
 		blockUploadSemaphore: semaphore.NewWeighted(int64(config.ConcurrentBlockUploadCount)),
 		blockCryptoSemaphore: semaphore.NewWeighted(int64(config.ConcurrentFileCryptoCount)),
+
+		pubKeyCache: make(map[string]*crypto.KeyRing),
 	}, credentials, nil
 }
 
@@ -189,8 +224,17 @@ func (protonDrive *ProtonDrive) getSignatureVerificationKeyring(emailAddresses [
 	}
 
 	for _, emailAddress := range emailAddresses {
+		if emailAddress == "" {
+			continue
+		}
 		if addr, ok := protonDrive.addrData[emailAddress]; ok {
 			if err := addKeysFromKR(ret, protonDrive.addrKRs[addr.ID]); err != nil {
+				return nil, err
+			}
+		} else if externalKR := protonDrive.getExternalPublicKeyRing(emailAddress); externalKR != nil {
+			// Signer is not one of our own addresses (e.g. the owner of a
+			// shared-with-me share) - verify with their public keys instead.
+			if err := addKeysFromKR(ret, externalKR); err != nil {
 				return nil, err
 			}
 		}
@@ -204,4 +248,32 @@ func (protonDrive *ProtonDrive) getSignatureVerificationKeyring(emailAddresses [
 		return nil, ErrNoKeyringForSignatureVerification
 	}
 	return ret, nil
+}
+
+func (protonDrive *ProtonDrive) getExternalPublicKeyRing(email string) *crypto.KeyRing {
+	protonDrive.pubKeyCacheMu.Lock()
+	defer protonDrive.pubKeyCacheMu.Unlock()
+
+	if kr, ok := protonDrive.pubKeyCache[email]; ok {
+		return kr
+	}
+
+	logger := protonDrive.Config.GetLogger()
+
+	publicKeys, _, err := protonDrive.c.GetPublicKeys(context.Background(), email)
+	if err != nil {
+		logger.Warnf("failed to fetch public keys of %s for signature verification: %v", email, err)
+		protonDrive.pubKeyCache[email] = nil
+		return nil
+	}
+
+	kr, err := publicKeys.GetKeyRing()
+	if err != nil || kr == nil || kr.CountEntities() == 0 {
+		logger.Warnf("no usable public keys of %s for signature verification: %v", email, err)
+		protonDrive.pubKeyCache[email] = nil
+		return nil
+	}
+
+	protonDrive.pubKeyCache[email] = kr
+	return kr
 }

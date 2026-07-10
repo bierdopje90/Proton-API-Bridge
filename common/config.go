@@ -60,6 +60,13 @@ type Config struct {
 
 	/* Drive */
 	DataFolderName string
+
+	// SharedShareID, when non-empty, makes the bridge operate on the given
+	// share instead of the volume's main share. This allows accessing a
+	// folder another user has shared with this account ("shared with me").
+	// The special value "auto" discovers the share automatically when the
+	// account has exactly one shared-with-me item.
+	SharedShareID string
 }
 
 // GetLogger returns the configured Logger or a stdlib-backed default
