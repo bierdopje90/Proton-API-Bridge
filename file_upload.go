@@ -23,6 +23,23 @@ func (protonDrive *ProtonDrive) handleRevisionConflict(ctx context.Context, link
 	if link != nil {
 		linkID := link.LinkID
 
+		// a draft-only link (left by an interrupted CreateFile) has no listable revisions:
+		// ListRevisions answers 2501 "not found", so handle it before GetRevisions
+		if link.State == proton.LinkStateDraft {
+			protonDrive.Config.GetLogger().Warnf("upload conflicts with draft-only link %s (state %d), replace_existing_draft=%v", linkID, link.State, protonDrive.Config.ReplaceExistingDraft)
+			if !protonDrive.Config.ReplaceExistingDraft {
+				return "", false, ErrDraftExists
+			}
+
+			// delete the link (skipping trash, otherwise it won't work)
+			err := protonDrive.c.DeleteChildren(ctx, protonDrive.MainShare.ShareID, link.ParentLinkID, linkID)
+			if err != nil {
+				return "", false, err
+			}
+
+			return "", true, nil
+		}
+
 		draftRevision, err := protonDrive.GetRevisions(ctx, link, proton.RevisionStateDraft)
 		if err != nil {
 			return "", false, err
